@@ -1,0 +1,15 @@
+venv/
+.ipynb_checkpoints
+
+# temporary files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# system files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
