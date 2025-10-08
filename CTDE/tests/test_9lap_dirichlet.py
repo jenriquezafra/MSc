@@ -8,7 +8,8 @@ def solve_dirichlet_laplacian_9pt(a, b, c, d,
                                   g_left, g_right,
                                   g_bottom, g_top,
                                   rhs=None):
-    """Resolver Poisson 2D con Dirichlet empleando el esquema de 9 puntos."""
+    """Solver of the 2D Poisson equation with Dirichlet boundary conditions with 9points scheme.
+    Here m_x==m_y"""
     if m_x <= 0 or m_y <= 0:
         raise ValueError("m_x y m_y deben ser enteros positivos.")
 
@@ -161,4 +162,4 @@ def solve_dirichlet_laplacian_9pt(a, b, c, d,
     U[:, 0] = left_boundary
     U[:, -1] = right_boundary
 
-    return X, Y, U, A_csr, F_vec
+    return X, Y, U
