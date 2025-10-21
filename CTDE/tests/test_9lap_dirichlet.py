@@ -10,8 +10,6 @@ def solve_dirichlet_laplacian_9pt(a, b, c, d,
                                   rhs=None):
     """Solver of the 2D Poisson equation with Dirichlet boundary conditions with 9points scheme.
     Here m_x==m_y"""
-    if m_x <= 0 or m_y <= 0:
-        raise ValueError("m_x y m_y deben ser enteros positivos.")
 
     h_x = (b - a) / (m_x + 1)
     h_y = (d - c) / (m_y + 1)
