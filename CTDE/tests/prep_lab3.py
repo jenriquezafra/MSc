@@ -1,178 +1,137 @@
 import numpy as np
+from scipy.sparse import diags, eye, kron
+from scipy.sparse.linalg import splu
 
 
-def solve_heat_equation_cn_2d(
-    ax,
-    bx,
-    ay,
-    by,
-    nx,
-    ny,
-    *,
-    dt,
-    n_steps,
-    initial_condition,
-    boundary_conditions,
-    diffusivity=1.0,
-    store_full_solution=False,
-):
+def solve_crank_nicolson_2d(mx, my, T_final, *, diffusivity=1.0):
     """
-    Solve the 2-D heat equation u_t = diffusivity * (u_xx + u_yy) on a rectangle using Crank-Nicolson.
+    Crank–Nicolson para la ecuación de calor 2D en [-1,1]x[-1,1] con BC Dirichlet.
 
-    Parameters
+    Requiere funciones globales:
+      - u0(x, y): condición inicial en la malla completa (incluye bordes)
+      - g_left(y, t), g_right(y, t), g_bottom(x, t), g_top(x, t): contornos Dirichlet
+
+    Parámetros
     ----------
-    ax, bx : float
-        Left and right limits of the spatial domain in x.
-    ay, by : float
-        Bottom and top limits of the spatial domain in y.
-    nx, ny : int
-        Number of interior grid points along x and y (boundary points are added automatically).
-    dt : float
-        Time step for the evolution.
-    n_steps : int
-        Number of time steps to advance (total time equals dt * n_steps).
-    initial_condition : callable
-        Function f(x, y) providing the initial condition on the interior nodes.
-    boundary_conditions : dict
-        Dictionary with callables for Dirichlet boundaries. Required keys: "left", "right", "bottom", "top".
-        Each callable must accept (coords, t) and return the boundary values at time t, where coords is the
-        coordinate array along the corresponding edge (x for bottom/top, y for left/right). Scalars are allowed.
-    diffusivity : float, optional
-        Thermal diffusivity coefficient (default 1.0).
-    store_full_solution : bool, optional
-        If True, return the full time history with shape (n_steps + 1, ny + 2, nx + 2). Otherwise only the final field.
+    mx, my : int
+        Número total de nodos en x e y (incluyendo bordes). Requiere mx>=3, my>=3.
+    T_final : float
+        Tiempo final de integración.
+    diffusivity : float, opcional
+        Coeficiente de difusión kappa.
 
-    Returns
-    -------
-    times : ndarray
-        Array of time instants, shape (n_steps + 1,).
-    X, Y : ndarray
-        Meshgrid arrays including boundaries, each with shape (ny + 2, nx + 2).
+    Devuelve
+    --------
+    x, y : ndarray
+        Vectores de malla incluyendo bordes. x.shape=(mx,), y.shape=(my,)
+    t : ndarray
+        Instantes de tiempo, shape (N+1,)
     U : ndarray
-        Temperature field. Shape is (n_steps + 1, ny + 2, nx + 2) if store_full_solution is True, otherwise (ny + 2, nx + 2).
+        Solución con shape (N+1, my, mx)
     """
-    required_keys = {"left", "right", "bottom", "top"}
-    if not required_keys.issubset(boundary_conditions):
-        missing = sorted(required_keys.difference(boundary_conditions))
-        raise ValueError(f"boundary_conditions missing keys: {missing}")
-
-    if nx <= 0 or ny <= 0:
-        raise ValueError("nx and ny must be positive integers (number of interior nodes).")
-    if dt <= 0.0:
-        raise ValueError("dt must be a positive float.")
-    if n_steps <= 0:
-        raise ValueError("n_steps must be a positive integer.")
+    if mx < 3 or my < 3:
+        raise ValueError("mx y my deben ser >= 3 para tener puntos interiores")
+    if T_final <= 0.0:
+        raise ValueError("T_final debe ser positivo")
     if diffusivity <= 0.0:
-        raise ValueError("diffusivity must be positive.")
+        raise ValueError("diffusivity debe ser positivo")
 
-    x = np.linspace(ax, bx, nx + 2, dtype=float)
-    y = np.linspace(ay, by, ny + 2, dtype=float)
+    # 1) Mallado espacial fijo en [-1,1]^2
+    ax = ay = -1.0
+    bx = by =  1.0
+    x = np.linspace(ax, bx, mx, dtype=float)
+    y = np.linspace(ay, by, my, dtype=float)
+    hx = x[1] - x[0]
+    hy = y[1] - y[0]
+
+    # 2) Paso temporal: proporcional a la escala espacial más fina
+    delta_t = min(hx, hy)
+    N = int(np.ceil(T_final / delta_t))
+    delta_t = T_final / max(N, 1)
+    t = np.linspace(0.0, T_final, N + 1)
+
+    # 3) Array solución: capas de tiempo completas (incluye bordes)
+    U = np.zeros((N + 1, my, mx), dtype=float)
+
+    # Condición inicial (incluye interior y bordes)
+    # Se asume u0 devuelve shape (my, mx) al evaluar sobre malla 2D
     X, Y = np.meshgrid(x, y, indexing="xy")
+    U[0] = u0(X, Y)
 
-    hx = (bx - ax) / (nx + 1)
-    hy = (by - ay) / (ny + 1)
-    hx2 = hx * hx
-    hy2 = hy * hy
+    # --- Matrices en puntos interiores ---
+    nx_int = mx - 2
+    ny_int = my - 2
+    M = nx_int * ny_int  # número de incógnitas interiores
 
-    times = np.linspace(0.0, dt * n_steps, n_steps + 1, dtype=float)
+    # --- Construcción del Laplaciano con sparse ---
+    ex = np.ones(nx_int)
+    ey = np.ones(ny_int)
+    Lx = diags([ex, -2*ex, ex], [-1,0,1], shape=(nx_int,nx_int)) / hx**2
+    Ly = diags([ey, -2*ey, ey], [-1,0,1], shape=(ny_int,ny_int)) / hy**2
 
-    left_fun = boundary_conditions["left"]
-    right_fun = boundary_conditions["right"]
-    bottom_fun = boundary_conditions["bottom"]
-    top_fun = boundary_conditions["top"]
+    Ix = eye(nx_int, format='csc')
+    Iy = eye(ny_int, format='csc')
 
-    def _boundary_array(t):
-        bottom_vals = np.broadcast_to(np.asarray(bottom_fun(x, t), dtype=float), x.shape).copy()
-        top_vals = np.broadcast_to(np.asarray(top_fun(x, t), dtype=float), x.shape).copy()
-        left_vals = np.broadcast_to(np.asarray(left_fun(y, t), dtype=float), y.shape).copy()
-        right_vals = np.broadcast_to(np.asarray(right_fun(y, t), dtype=float), y.shape).copy()
+    L = kron(Iy, Lx, format='csc') + kron(Ly, Ix, format='csc')
 
-        boundary = np.zeros((ny + 2, nx + 2), dtype=float)
-        boundary[:, 0] = left_vals
-        boundary[:, -1] = right_vals
-        boundary[0, :] = bottom_vals
-        boundary[-1, :] = top_vals
-        return boundary
+    factor = 0.5 * diffusivity * delta_t
+    A = eye(M, format='csc') - factor * L
+    B = eye(M, format='csc') + factor * L
 
-    def _boundary_contribution(boundary):
-        contrib = np.zeros((ny, nx), dtype=float)
-        contrib[:, 0] += boundary[1:-1, 0] / hx2
-        contrib[:, -1] += boundary[1:-1, -1] / hx2
-        contrib[0, :] += boundary[0, 1:-1] / hy2
-        contrib[-1, :] += boundary[-1, 1:-1] / hy2
-        return contrib.ravel(order="C")
-
-    # Assemble dense Laplacian and Crank-Nicolson matrices on interior nodes.
-    num_unknowns = nx * ny
-    factor = 0.5 * diffusivity * dt
-
-    laplacian = np.zeros((num_unknowns, num_unknowns), dtype=float)
-
-    def linear_index(i, j):
-        return j * nx + i
-
-    for j in range(ny):
-        for i in range(nx):
-            k = linear_index(i, j)
-            laplacian[k, k] = -2.0 / hx2 - 2.0 / hy2
-            if i > 0:
-                laplacian[k, linear_index(i - 1, j)] = 1.0 / hx2
-            if i < nx - 1:
-                laplacian[k, linear_index(i + 1, j)] = 1.0 / hx2
-            if j > 0:
-                laplacian[k, linear_index(i, j - 1)] = 1.0 / hy2
-            if j < ny - 1:
-                laplacian[k, linear_index(i, j + 1)] = 1.0 / hy2
-
-    identity = np.eye(num_unknowns, dtype=float)
-    matrix_left = identity - factor * laplacian
-    matrix_right = identity + factor * laplacian
-
-    def apply_right(vec):
-        return matrix_right @ vec
+    # Prefactorización LU
+    A_lu = splu(A)
 
     def solve_linear(rhs):
-        return np.linalg.solve(matrix_left, rhs)
+        return A_lu.solve(rhs)
 
-    U_current = np.zeros((ny + 2, nx + 2), dtype=float)
-    interior_ic = initial_condition(X[1:-1, 1:-1], Y[1:-1, 1:-1])
-    U_current[1:-1, 1:-1] = np.asarray(interior_ic, dtype=float)
+    # Helpers de contorno
+    def boundary_arrays(time):
+        gB = np.broadcast_to(np.asarray(g_bottom(x, time), dtype=float), (mx,))
+        gT = np.broadcast_to(np.asarray(g_top(x, time), dtype=float), (mx,))
+        gL = np.broadcast_to(np.asarray(g_left(y, time), dtype=float), (my,))
+        gR = np.broadcast_to(np.asarray(g_right(y, time), dtype=float), (my,))
+        return gL, gR, gB, gT
 
-    boundary_at_t0 = _boundary_array(times[0])
-    U_current[:, 0] = boundary_at_t0[:, 0]
-    U_current[:, -1] = boundary_at_t0[:, -1]
-    U_current[0, :] = boundary_at_t0[0, :]
-    U_current[-1, :] = boundary_at_t0[-1, :]
+    def boundary_contrib(gL, gR, gB, gT):
+        # contribución en vector interior de tamaño (ny_int, nx_int) -> ravel C
+        contrib = np.zeros((ny_int, nx_int), dtype=float)
+        # columnas interiores adyacentes a izquierda/derecha
+        contrib[:, 0]     += gL[1:-1] / hx**2
+        contrib[:, -1]    += gR[1:-1] / hx**2
+        # filas interiores adyacentes a abajo/arriba
+        contrib[0, :]     += gB[1:-1] / hy**2
+        contrib[-1, :]    += gT[1:-1] / hy**2
+        return contrib.ravel(order="C")
 
-    u_vec = U_current[1:-1, 1:-1].ravel(order="C")
+    # Vector interior en t0
+    U_int = U[0, 1:-1, 1:-1].ravel(order="C")
 
-    if store_full_solution:
-        history = np.zeros((n_steps + 1, ny + 2, nx + 2), dtype=float)
-        history[0] = U_current
+    # --- Bucle temporal ---
+    for n in range(N):
+        tn, tnp1 = t[n], t[n + 1]
 
-    for step in range(n_steps):
-        t_n = times[step]
-        t_np1 = times[step + 1]
+        gL_n, gR_n, gB_n, gT_n       = boundary_arrays(tn)
+        gL_np1, gR_np1, gB_np1, gT_np1 = boundary_arrays(tnp1)
 
-        boundary_n = _boundary_array(t_n)
-        boundary_np1 = _boundary_array(t_np1)
+        # Impone contorno en la capa n para coherencia
+        U[n, :, 0]  = gL_n
+        U[n, :, -1] = gR_n
+        U[n, 0, :]  = gB_n
+        U[n, -1, :] = gT_n
 
-        rhs = apply_right(u_vec)
-        rhs += factor * (_boundary_contribution(boundary_n) + _boundary_contribution(boundary_np1))
+        # RHS de CN en interior
+        bc = factor * (boundary_contrib(gL_n, gR_n, gB_n, gT_n)
+                       + boundary_contrib(gL_np1, gR_np1, gB_np1, gT_np1))
+        b = B @ U_int + bc
 
-        u_vec = solve_linear(rhs)
-        U_current[1:-1, 1:-1] = u_vec.reshape((ny, nx), order="C")
+        # Resolver sistema lineal (sin inversa explícita)
+        U_int = solve_linear(b)
 
-        U_current[:, 0] = boundary_np1[:, 0]
-        U_current[:, -1] = boundary_np1[:, -1]
-        U_current[0, :] = boundary_np1[0, :]
-        U_current[-1, :] = boundary_np1[-1, :]
+        # Escribir capa n+1
+        U[n + 1, 1:-1, 1:-1] = U_int.reshape((ny_int, nx_int), order="C")
+        U[n + 1, :, 0]  = gL_np1
+        U[n + 1, :, -1] = gR_np1
+        U[n + 1, 0, :]  = gB_np1
+        U[n + 1, -1, :] = gT_np1
 
-        if store_full_solution:
-            history[step + 1] = U_current
-
-    if store_full_solution:
-        return times, X, Y, history
-    return times, X, Y, U_current
-
-
+    return x, y, t, U
